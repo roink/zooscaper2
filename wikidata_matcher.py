@@ -21,7 +21,7 @@ import httpx
 from zootier_scraper_sqlite import DB_FILE, ensure_db_schema
 
 SPARQL_URL = "https://query.wikidata.org/sparql"
-USER_AGENT = "ZooTracker/1.0 (contact: your-email@example.org)"
+USER_AGENT = "ZooTracker/1.0 (contact: contact@zootracker.app)"
 
 SPECIES_QID = "Q7432"
 SUBSPECIES_QID = "Q68947"
@@ -41,23 +41,40 @@ def _norm(name: str) -> str:
     return unicodedata.normalize("NFC", re.sub(r"\s+", " ", name.strip())).casefold()
 
 
-async def _sparql(client: httpx.AsyncClient, query: str) -> dict:
+async def _sparql(client: httpx.AsyncClient, query: str, *, use_get: bool = False) -> dict:
     for attempt in range(3):
         try:
             await asyncio.sleep(random.uniform(0.05, 0.15))
             async with _SEM:
-                r = await client.post(
-                    SPARQL_URL,
-                    data={"query": query, "format": "json"},
-                    headers={
-                        "User-Agent": USER_AGENT,
-                        "Accept": "application/sparql-results+json",
-                        "Content-Type": "application/x-www-form-urlencoded",
-                    },
-                    timeout=30.0,
-                )
+                if use_get:
+                    r = await client.get(
+                        SPARQL_URL,
+                        params={"query": query, "format": "json"},
+                        headers={
+                            "User-Agent": USER_AGENT,
+                            "Accept": "application/sparql-results+json",
+                        },
+                    )
+                else:
+                    r = await client.post(
+                        SPARQL_URL,
+                        data={"query": query, "format": "json"},
+                        headers={
+                            "User-Agent": USER_AGENT,
+                            "Accept": "application/sparql-results+json",
+                            "Content-Type": "application/x-www-form-urlencoded",
+                        },
+                    )
             if r.status_code in (429, 503):
-                raise httpx.HTTPStatusError("retry", request=r.request, response=r)
+                retry = r.headers.get("Retry-After")
+                try:
+                    delay = float(retry) if retry is not None else None
+                except ValueError:
+                    delay = None
+                if delay is None:
+                    delay = (2 ** attempt) + random.random()
+                await asyncio.sleep(delay)
+                continue
             r.raise_for_status()
             return r.json()
         except Exception:
@@ -133,8 +150,8 @@ async def _sparql_batch_p225(client: httpx.AsyncClient, names: List[str], method
         if key not in _CACHE_P225 and key not in seen:
             to_query.append(n)
             seen.add(key)
-    for i in range(0, len(to_query), 40):
-        chunk = to_query[i : i + 40]
+    for i in range(0, len(to_query), 25):
+        chunk = to_query[i : i + 25]
         values = " ".join(
             f'("{_escape_for_sparql_literal(c)}")' for c in chunk
         )
@@ -152,7 +169,7 @@ SELECT ?input ?item ?taxonName ?rank ?status ?enLabel ?deLabel ?vernEn ?vernDe W
   OPTIONAL{{?item wdt:P1843 ?vernEn FILTER(lang(?vernEn)="en")}}
   OPTIONAL{{?item wdt:P1843 ?vernDe FILTER(lang(?vernDe)="de")}}
 }}"""
-        data = await _sparql(client, q)
+        data = await _sparql(client, q, use_get=len(chunk) == 1)
         for b in data.get("results", {}).get("bindings", []):
             inp = b["input"]["value"]
             key = _norm(inp)
@@ -186,8 +203,8 @@ async def _sparql_batch_label_or_vern(client: httpx.AsyncClient, names: List[str
         if key not in _CACHE_LABEL and key not in seen:
             to_query.append(n)
             seen.add(key)
-    for i in range(0, len(to_query), 40):
-        chunk = to_query[i : i + 40]
+    for i in range(0, len(to_query), 25):
+        chunk = to_query[i : i + 25]
         values = " ".join(
             f'("{_escape_for_sparql_literal(c)}")' for c in chunk
         )
@@ -210,7 +227,7 @@ SELECT ?input ?item ?taxonName ?rank ?status ?enLabel ?deLabel ?vernEn ?vernDe W
   OPTIONAL{{?item wdt:P1843 ?vernEn FILTER(lang(?vernEn)="en")}}
   OPTIONAL{{?item wdt:P1843 ?vernDe FILTER(lang(?vernDe)="de")}}
 }}"""
-        data = await _sparql(client, q)
+        data = await _sparql(client, q, use_get=len(chunk) == 1)
         for b in data.get("results", {}).get("bindings", []):
             inp = b["input"]["value"]
             key_cache = (lang, _norm(inp))
@@ -302,7 +319,7 @@ async def process_animals(db_path: str = DB_FILE, client: Optional[httpx.AsyncCl
     own_client = False
     if client is None:
         client = httpx.AsyncClient(
-            timeout=30,
+            timeout=httpx.Timeout(90.0),
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
         own_client = True

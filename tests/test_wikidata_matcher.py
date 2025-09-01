@@ -76,7 +76,11 @@ async def test_collision_keeps_better(tmp_path):
     conn.close()
 
     def handler(request: httpx.Request) -> httpx.Response:
-        params = httpx.QueryParams(request.content.decode())
+        params = (
+            httpx.QueryParams(request.url.query)
+            if request.method == "GET"
+            else httpx.QueryParams(request.content.decode())
+        )
         q = params.get("query", "")
         bindings = []
         if "wdt:P225" in q:
@@ -122,7 +126,11 @@ async def test_batch_query_uses_values():
     queries = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        params = httpx.QueryParams(request.content.decode())
+        params = (
+            httpx.QueryParams(request.url.query)
+            if request.method == "GET"
+            else httpx.QueryParams(request.content.decode())
+        )
         queries.append(params["query"])
         return httpx.Response(200, json={"results": {"bindings": []}})
 
@@ -140,9 +148,31 @@ async def test_batch_query_uses_values():
 
 
 @pytest.mark.asyncio
+async def test_single_name_uses_get():
+    methods = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        methods.append(request.method)
+        return httpx.Response(200, json={"results": {"bindings": []}})
+
+    transport = httpx.MockTransport(handler)
+    from wikidata_matcher import _CACHE_P225
+
+    _CACHE_P225.clear()
+    async with httpx.AsyncClient(transport=transport) as client:
+        await _sparql_batch_p225(client, ["A"], "p225_exact")
+
+    assert methods == ["GET"]
+
+
+@pytest.mark.asyncio
 async def test_find_qid_helper():
     def handler(request: httpx.Request) -> httpx.Response:
-        params = httpx.QueryParams(request.content.decode())
+        params = (
+            httpx.QueryParams(request.url.query)
+            if request.method == "GET"
+            else httpx.QueryParams(request.content.decode())
+        )
         q = params.get("query", "")
         bindings = []
         if "wdt:P225" in q:
