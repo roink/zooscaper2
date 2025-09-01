@@ -175,3 +175,167 @@ async def test_process_animals_updates_db(tmp_path):
     assert data["1"] == ("Q1", "auto", "p225_exact_primary", 95.0)
     assert data["2"] == (None, "none", None, None)
     assert cand_rows == [("2", "Q2", "api_search")]
+
+
+@pytest.mark.asyncio
+async def test_process_animals_handles_existing_collision(tmp_path):
+    db_path = tmp_path / "t.db"
+    conn = sqlite3.connect(db_path)
+    ensure_db_schema(conn)
+    conn.execute(
+        "INSERT INTO animal (art, klasse, normalized_latin_name, zoo_count, wikidata_qid, wikidata_match_status) VALUES (?,?,?,?,?,?)",
+        ("1", 1, "Pavo cristatus", 5, "Q1", "auto"),
+    )
+    conn.execute(
+        "INSERT INTO animal (art, klasse, normalized_latin_name, zoo_count) VALUES (?,?,?,?)",
+        ("2", 1, "Pavo cristatus", 4),
+    )
+    conn.commit()
+    conn.close()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "query.wikidata.org":
+            params = httpx.QueryParams(request.content.decode())
+            q = params.get("query", "")
+            if "Pavo cristatus" in q and "P105" not in q:
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": {
+                            "bindings": [
+                                {
+                                    "item": {
+                                        "type": "uri",
+                                        "value": "http://www.wikidata.org/entity/Q1",
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                )
+            return httpx.Response(200, json={"results": {"bindings": []}})
+        return httpx.Response(500)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        await process_animals(db_path=str(db_path), client=client)
+
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT wikidata_qid, wikidata_match_status FROM animal WHERE art='2'"
+    ).fetchone()
+    conn.close()
+    assert row == (None, "collision")
+
+
+@pytest.mark.asyncio
+async def test_process_animals_is_resumable_and_idempotent(tmp_path):
+    db_path = tmp_path / "t.db"
+    conn = sqlite3.connect(db_path)
+    ensure_db_schema(conn)
+    conn.execute(
+        "INSERT INTO animal (art, klasse, normalized_latin_name, zoo_count) VALUES (?,?,?,?)",
+        ("1", 1, "Pavo cristatus", 5),
+    )
+    conn.commit()
+    conn.close()
+
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        if request.url.host == "query.wikidata.org":
+            params = httpx.QueryParams(request.content.decode())
+            q = params.get("query", "")
+            if "Pavo cristatus" in q and "P105" not in q:
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": {
+                            "bindings": [
+                                {
+                                    "item": {
+                                        "type": "uri",
+                                        "value": "http://www.wikidata.org/entity/Q1",
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                )
+            if "wd:Q1 wdt:P105" in q:
+                return httpx.Response(
+                    200,
+                    json={
+                        "results": {
+                            "bindings": [
+                                {
+                                    "rank": {
+                                        "type": "uri",
+                                        "value": "http://www.wikidata.org/entity/Q7432",
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                )
+            return httpx.Response(200, json={"results": {"bindings": []}})
+        return httpx.Response(500)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        await process_animals(db_path=str(db_path), client=client)
+        calls_after_first = calls["count"]
+        await process_animals(db_path=str(db_path), client=client)
+    assert calls["count"] == calls_after_first
+
+
+@pytest.mark.asyncio
+async def test_process_animals_uses_existing_qid_without_status(tmp_path):
+    db_path = tmp_path / "t.db"
+    conn = sqlite3.connect(db_path)
+    ensure_db_schema(conn)
+    conn.execute(
+        "INSERT INTO animal (art, klasse, normalized_latin_name, zoo_count, wikidata_qid) VALUES (?,?,?,?,?)",
+        ("1", 1, "Pavo cristatus", 5, "Q1"),
+    )
+    conn.commit()
+    conn.close()
+
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url)
+        assert request.url.path != "/w/api.php"
+        params = httpx.QueryParams(request.content.decode())
+        q = params.get("query", "")
+        assert "P225" not in q
+        if "wd:Q1 wdt:P105" in q:
+            return httpx.Response(
+                200,
+                json={
+                    "results": {
+                        "bindings": [
+                            {
+                                "rank": {
+                                    "type": "uri",
+                                    "value": "http://www.wikidata.org/entity/Q7432",
+                                }
+                            }
+                        ]
+                    }
+                },
+            )
+        return httpx.Response(500)
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        await process_animals(db_path=str(db_path), client=client)
+
+    assert len(calls) == 1
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        "SELECT wikidata_qid, wikidata_match_status, wikidata_match_method, wikidata_match_score FROM animal"
+    ).fetchone()
+    conn.close()
+    assert row == ("Q1", "auto", "existing_qid", 100.0)
