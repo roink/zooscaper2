@@ -346,10 +346,47 @@ def ensure_db_schema(conn):
         c.execute("ALTER TABLE animal ADD COLUMN trade_code TEXT")
     if "zoo_count" not in cols:
         c.execute("ALTER TABLE animal ADD COLUMN zoo_count INTEGER DEFAULT 0")
+    if "wikidata_qid" not in cols:
+        c.execute("ALTER TABLE animal ADD COLUMN wikidata_qid TEXT")
+    if "wikidata_match_status" not in cols:
+        c.execute("ALTER TABLE animal ADD COLUMN wikidata_match_status TEXT")
+    if "wikidata_match_method" not in cols:
+        c.execute("ALTER TABLE animal ADD COLUMN wikidata_match_method TEXT")
+    if "wikidata_match_score" not in cols:
+        c.execute("ALTER TABLE animal ADD COLUMN wikidata_match_score REAL")
+    if "wikidata_review_json" not in cols:
+        c.execute("ALTER TABLE animal ADD COLUMN wikidata_review_json TEXT")
 
     cols_zoo = [row[1] for row in c.execute("PRAGMA table_info(zoo)")]
     if "species_count" not in cols_zoo:
         c.execute("ALTER TABLE zoo ADD COLUMN species_count INTEGER DEFAULT 0")
+
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS animal_wikidata_candidates (
+            art TEXT,
+            candidate_qid TEXT,
+            score REAL,
+            method TEXT,
+            debug TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(art, candidate_qid),
+            FOREIGN KEY(art) REFERENCES animal(art)
+        )
+        """
+    )
+    c.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uniq_wikidata_qid_processed
+        ON animal(wikidata_qid)
+        WHERE klasse < 6
+          AND qualifier IS NULL
+          AND qualifier_target IS NULL
+          AND locality IS NULL
+          AND trade_code IS NULL
+          AND wikidata_qid IS NOT NULL
+        """
+    )
 
     conn.commit()
 
