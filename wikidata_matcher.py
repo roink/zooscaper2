@@ -29,7 +29,11 @@ ACCEPTED_NAME_QID = "Q3958441"
 
 _CACHE_P225: Dict[str, List[dict]] = {}
 _CACHE_LABEL: Dict[tuple[str, str], List[dict]] = {}
-_SEM = asyncio.Semaphore(4)
+MAX_ATTEMPTS = 5
+_SEM = asyncio.Semaphore(2)
+CHUNK_SIZE = 8
+CHUNK_DELAY_MIN = 0.20
+CHUNK_DELAY_MAX = 0.40
 
 
 def _escape_for_sparql_literal(s: str) -> str:
@@ -42,7 +46,7 @@ def _norm(name: str) -> str:
 
 
 async def _sparql(client: httpx.AsyncClient, query: str, *, use_get: bool = False) -> dict:
-    for attempt in range(3):
+    for attempt in range(MAX_ATTEMPTS):
         try:
             await asyncio.sleep(random.uniform(0.05, 0.15))
             async with _SEM:
@@ -65,7 +69,7 @@ async def _sparql(client: httpx.AsyncClient, query: str, *, use_get: bool = Fals
                             "Content-Type": "application/x-www-form-urlencoded",
                         },
                     )
-            if r.status_code in (429, 503):
+            if r.status_code in (429, 502, 503, 504):
                 retry = r.headers.get("Retry-After")
                 try:
                     delay = float(retry) if retry is not None else None
@@ -78,7 +82,7 @@ async def _sparql(client: httpx.AsyncClient, query: str, *, use_get: bool = Fals
             r.raise_for_status()
             return r.json()
         except Exception:
-            if attempt == 2:
+            if attempt == MAX_ATTEMPTS - 1:
                 raise
             await asyncio.sleep((2 ** attempt) + random.random())
     return {}
@@ -150,15 +154,15 @@ async def _sparql_batch_p225(client: httpx.AsyncClient, names: List[str], method
         if key not in _CACHE_P225 and key not in seen:
             to_query.append(n)
             seen.add(key)
-    for i in range(0, len(to_query), 25):
-        chunk = to_query[i : i + 25]
+    for i in range(0, len(to_query), CHUNK_SIZE):
+        chunk = to_query[i : i + CHUNK_SIZE]
         values = " ".join(
             f'("{_escape_for_sparql_literal(c)}")' for c in chunk
         )
         q = f"""
 PREFIX wdt: <http://www.wikidata.org/prop/direct/>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-SELECT ?input ?item ?taxonName ?rank ?status ?enLabel ?deLabel ?vernEn ?vernDe WHERE {{
+SELECT ?input ?item ?taxonName ?rank ?status ?enLabel ?deLabel WHERE {{
   VALUES (?input) {{ {values} }}
   ?item wdt:P31 wd:Q16521; wdt:P225 ?taxonName.
   FILTER(lcase(?taxonName)=lcase(?input))
@@ -166,10 +170,9 @@ SELECT ?input ?item ?taxonName ?rank ?status ?enLabel ?deLabel ?vernEn ?vernDe W
   OPTIONAL{{?item wdt:P2316 ?status}}
   OPTIONAL{{?item rdfs:label ?enLabel FILTER(lang(?enLabel)="en")}}
   OPTIONAL{{?item rdfs:label ?deLabel FILTER(lang(?deLabel)="de")}}
-  OPTIONAL{{?item wdt:P1843 ?vernEn FILTER(lang(?vernEn)="en")}}
-  OPTIONAL{{?item wdt:P1843 ?vernDe FILTER(lang(?vernDe)="de")}}
 }}"""
         data = await _sparql(client, q, use_get=len(chunk) == 1)
+        await asyncio.sleep(random.uniform(CHUNK_DELAY_MIN, CHUNK_DELAY_MAX))
         for b in data.get("results", {}).get("bindings", []):
             inp = b["input"]["value"]
             key = _norm(inp)
@@ -180,8 +183,8 @@ SELECT ?input ?item ?taxonName ?rank ?status ?enLabel ?deLabel ?vernEn ?vernDe W
                 "status": b.get("status", {}).get("value", "").rsplit("/", 1)[-1] or None,
                 "label_en": b.get("enLabel", {}).get("value"),
                 "label_de": b.get("deLabel", {}).get("value"),
-                "vern_en": [b["vernEn"]["value"]] if "vernEn" in b else [],
-                "vern_de": [b["vernDe"]["value"]] if "vernDe" in b else [],
+                "vern_en": [],
+                "vern_de": [],
                 "method": method,
             }
             _CACHE_P225.setdefault(key, []).append(cand)
@@ -203,31 +206,26 @@ async def _sparql_batch_label_or_vern(client: httpx.AsyncClient, names: List[str
         if key not in _CACHE_LABEL and key not in seen:
             to_query.append(n)
             seen.add(key)
-    for i in range(0, len(to_query), 25):
-        chunk = to_query[i : i + 25]
+    for i in range(0, len(to_query), CHUNK_SIZE):
+        chunk = to_query[i : i + CHUNK_SIZE]
         values = " ".join(
             f'("{_escape_for_sparql_literal(c)}")' for c in chunk
         )
         q = f"""
 PREFIX wdt:<http://www.wikidata.org/prop/direct/>
 PREFIX rdfs:<http://www.w3.org/2000/01/rdf-schema#>
-SELECT ?input ?item ?taxonName ?rank ?status ?enLabel ?deLabel ?vernEn ?vernDe WHERE {{
+SELECT ?input ?item ?taxonName ?rank ?status ?enLabel ?deLabel WHERE {{
   VALUES (?input) {{ {values} }}
   ?item wdt:P31 wd:Q16521.
   OPTIONAL{{?item wdt:P225 ?taxonName}}
   OPTIONAL{{?item wdt:P105 ?rank}}
   OPTIONAL{{?item wdt:P2316 ?status}}
-  {{
-    ?item rdfs:label ?lab . FILTER(lang(?lab)="{lang}") FILTER(lcase(?lab)=lcase(?input))
-  }} UNION {{
-    ?item wdt:P1843 ?vern . FILTER(lang(?vern)="{lang}") FILTER(lcase(?vern)=lcase(?input))
-  }}
+  ?item rdfs:label ?lab . FILTER(lang(?lab)="{lang}") FILTER(lcase(?lab)=lcase(?input))
   OPTIONAL{{?item rdfs:label ?enLabel FILTER(lang(?enLabel)="en")}}
   OPTIONAL{{?item rdfs:label ?deLabel FILTER(lang(?deLabel)="de")}}
-  OPTIONAL{{?item wdt:P1843 ?vernEn FILTER(lang(?vernEn)="en")}}
-  OPTIONAL{{?item wdt:P1843 ?vernDe FILTER(lang(?vernDe)="de")}}
 }}"""
         data = await _sparql(client, q, use_get=len(chunk) == 1)
+        await asyncio.sleep(random.uniform(CHUNK_DELAY_MIN, CHUNK_DELAY_MAX))
         for b in data.get("results", {}).get("bindings", []):
             inp = b["input"]["value"]
             key_cache = (lang, _norm(inp))
@@ -238,8 +236,8 @@ SELECT ?input ?item ?taxonName ?rank ?status ?enLabel ?deLabel ?vernEn ?vernDe W
                 "status": b.get("status", {}).get("value", "").rsplit("/", 1)[-1] or None,
                 "label_en": b.get("enLabel", {}).get("value"),
                 "label_de": b.get("deLabel", {}).get("value"),
-                "vern_en": [b["vernEn"]["value"]] if "vernEn" in b else [],
-                "vern_de": [b["vernDe"]["value"]] if "vernDe" in b else [],
+                "vern_en": [],
+                "vern_de": [],
                 "method": method,
             }
             _CACHE_LABEL.setdefault(key_cache, []).append(cand)
