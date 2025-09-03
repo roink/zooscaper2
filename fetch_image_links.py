@@ -34,10 +34,9 @@ import asyncio
 import json
 import random
 import re
-import sqlite3
 import sys
 from html import unescape
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping
 from urllib.parse import quote, urlparse, unquote
 
 import aiosqlite
@@ -175,7 +174,6 @@ async def commons_file_core(
         return None
 
     pageid = page.get("pageid")
-    canonical = page.get("canonicalurl") or page.get("title") or page.get("canonicaltitle") or page.get("title")
     iis = page.get("imageinfo", [])
     if not iis:
         return None
