@@ -136,10 +136,17 @@ async def _rank_ok(client: httpx.AsyncClient, qid: str, expected_tokens: int) ->
 
 
 def _save(conn, art, qid, status, method=None, score=None):
-    conn.execute(
-        "UPDATE animal SET wikidata_qid=?, wikidata_match_status=?, wikidata_match_method=?, wikidata_match_score=? WHERE art=?",
-        (qid, status, method, score, art),
-    )
+    try:
+        conn.execute(
+            "UPDATE animal SET wikidata_qid=?, wikidata_match_status=?, wikidata_match_method=?, wikidata_match_score=? WHERE art=?",
+            (qid, status, method, score, art),
+        )
+    except sqlite3.IntegrityError:
+        conn.rollback()
+        conn.execute(
+            "UPDATE animal SET wikidata_qid=?, wikidata_match_status=?, wikidata_match_method=?, wikidata_match_score=? WHERE art=?",
+            (None, "collision", method, score, art),
+        )
 
 
 def _store_candidates(conn, art, candidates, method, debug=None):
@@ -187,7 +194,9 @@ async def find_qid(client: httpx.AsyncClient, animal: dict) -> tuple[Optional[st
 
 
 async def process_animals(
-    db_path: str = DB_FILE, client: httpx.AsyncClient | None = None
+    db_path: str = DB_FILE,
+    client: httpx.AsyncClient | None = None,
+    concurrency: int = 10,
 ) -> None:
     """Process all eligible animals and update their Wikidata QIDs."""
     conn = sqlite3.connect(db_path)
@@ -195,25 +204,55 @@ async def process_animals(
     cur = conn.cursor()
     cur.execute(
         """
-SELECT art, normalized_latin_name, alternative_latin_names, name_en, name_de
+SELECT art, normalized_latin_name, alternative_latin_names, name_en, name_de, wikidata_qid
 FROM animal
 WHERE klasse < 6
   AND qualifier IS NULL
   AND qualifier_target IS NULL
   AND locality IS NULL
   AND trade_code IS NULL
-  AND wikidata_qid IS NULL
+  AND wikidata_match_status IS NULL
 ORDER BY zoo_count DESC
-"""
+""",
     )
     rows = cur.fetchall()
-    assigned: set[str] = set()
+    assigned: set[str] = {
+        qid
+        for (qid,) in conn.execute(
+            "SELECT wikidata_qid FROM animal WHERE wikidata_qid IS NOT NULL"
+        )
+    }
     http_client = client or httpx.AsyncClient(timeout=90)
     if client is None:
         await http_client.__aenter__()
-    try:
-        http_client.headers.update({"User-Agent": USER_AGENT})
-        for art, latin, alts, name_en, name_de in rows:
+    db_lock = asyncio.Lock()
+    assigned_lock = asyncio.Lock()
+    sem = asyncio.Semaphore(max(1, concurrency))
+
+    async def handle_row(row: tuple[str, str, str, str, str, Optional[str]]) -> None:
+        art, latin, alts, name_en, name_de, existing_qid = row
+        async with sem:
+            if existing_qid:
+                expected = _expected_rank_token_count(latin)
+                status = (
+                    "auto"
+                    if await _rank_ok(http_client, existing_qid, expected)
+                    else "review"
+                )
+                async with db_lock:
+                    _save(
+                        conn,
+                        art,
+                        existing_qid,
+                        status,
+                        method="existing_qid",
+                        score=100,
+                    )
+                    conn.commit()
+                async with assigned_lock:
+                    assigned.add(existing_qid)
+                return
+
             animal = {
                 "normalized_latin_name": latin,
                 "alternative_latin_names": alts,
@@ -225,25 +264,42 @@ ORDER BY zoo_count DESC
             except Exception:
                 qid = method = score = None
                 candidates = []
-            if qid and qid not in assigned:
-                expected = _expected_rank_token_count(latin)
-                status = "auto" if await _rank_ok(http_client, qid, expected) else "review"
-                _save(conn, art, qid, status, method, score)
-                if status == "auto":
-                    assigned.add(qid)
-            elif qid:
-                print(f"collision for {art}: {qid}")
-                _save(conn, art, None, "collision")
+
+            if qid:
+                async with assigned_lock:
+                    if qid in assigned:
+                        collision = True
+                    else:
+                        assigned.add(qid)
+                        collision = False
+                if not collision:
+                    expected = _expected_rank_token_count(latin)
+                    status = (
+                        "auto" if await _rank_ok(http_client, qid, expected) else "review"
+                    )
+                    async with db_lock:
+                        _save(conn, art, qid, status, method, score)
+                        conn.commit()
+                else:
+                    print(f"collision for {art}: {qid}")
+                    async with db_lock:
+                        _save(conn, art, None, "collision")
+                        conn.commit()
             else:
-                _save(conn, art, None, "none")
-                if candidates:
-                    _store_candidates(conn, art, candidates, "api_search")
-            conn.commit()
+                async with db_lock:
+                    _save(conn, art, None, "none")
+                    if candidates:
+                        _store_candidates(conn, art, candidates, "api_search")
+                    conn.commit()
+
+    try:
+        http_client.headers.update({"User-Agent": USER_AGENT})
+        tasks = [asyncio.create_task(handle_row(r)) for r in rows]
+        await asyncio.gather(*tasks)
     finally:
         if client is None:
             await http_client.__aexit__(None, None, None)
         conn.close()
-
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation
     asyncio.run(process_animals())
